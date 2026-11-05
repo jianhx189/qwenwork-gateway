@@ -361,6 +361,48 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { logs: lines.map(l => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean) })
       }
 
+      if (action === 'stats' && req.method === 'GET') {
+        // 用量统计：近 24h 按小时、按模型、按账号、今日汇总
+        const now = Date.now()
+        const hourStart = now - (now % 3600000)
+        const buckets = new Map()
+        for (let i = 23; i >= 0; i--) {
+          const t = hourStart - i * 3600000
+          buckets.set(t, { t, n: 0, err: 0, ms: 0 })
+        }
+        const byModel = new Map(), byAccount = new Map()
+        let total = 0, errors = 0, today = 0, todayErr = 0, msSum = 0, msN = 0
+        const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0)
+        if (existsSync(LOG_FILE)) {
+          for (const line of readFileSync(LOG_FILE, 'utf8').split('\n')) {
+            if (!line.trim()) continue
+            let l; try { l = JSON.parse(line) } catch { continue }
+            if (l.type !== 'chat' && l.type !== 'chat_error') continue
+            total++
+            const isErr = l.type === 'chat_error'
+            if (isErr) errors++
+            if (l.ms) { msSum += l.ms; msN++ }
+            if (l.ts >= dayStart.getTime()) { today++; if (isErr) todayErr++ }
+            const b = buckets.get(l.ts - (l.ts % 3600000))
+            if (b) { b.n++; if (isErr) b.err++; if (l.ms) b.ms += l.ms }
+            const mk = l.model || 'unknown'
+            const cur = byModel.get(mk) || { model: mk, n: 0, err: 0 }
+            cur.n++; if (isErr) cur.err++; byModel.set(mk, cur)
+            const ak = l.account || 'unknown'
+            const ac = byAccount.get(ak) || { account: ak, n: 0, err: 0 }
+            ac.n++; if (isErr) ac.err++; byAccount.set(ak, ac)
+          }
+        }
+        return json(res, 200, {
+          hourly: [...buckets.values()].sort((a, b) => a.t - b.t),
+          byModel: [...byModel.values()].sort((a, b) => b.n - a.n),
+          byAccount: [...byAccount.values()].sort((a, b) => b.n - a.n),
+          total, errors, today, todayErr,
+          avgMs: msN ? Math.round(msSum / msN) : 0,
+          successRate: total ? Number(((total - errors) / total).toFixed(3)) : 1,
+        })
+      }
+
       return json(res, 404, { error: 'not found' })
     }
 

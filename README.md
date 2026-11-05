@@ -1,10 +1,41 @@
 # QwenWork Gateway · 千问办公网关
 
-把**千问办公（QwenWork）账号里的办公积分**，变成一个带管理后台的 **OpenAI 兼容 API**。
+**把千问办公（QwenWork）账号里的办公积分，变成一个带管理后台的 OpenAI 兼容 API。**
+可直接接进 **Claude Code / Codex / Cherry Studio / Cline**，也能作为 **new-api / one-api** 的上游渠道。
 
-单个二进制依赖都没有：一个 `server.mjs` + 一个签名组件（WASM）就能跑。多账号、自动续期、余额看板、API 令牌、调用日志，全部自带。
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![Node.js 20+](https://img.shields.io/badge/Node.js-20%2B-339933)
+![Zero dependencies](https://img.shields.io/badge/dependencies-0-blue)
+![AI one-click install](https://img.shields.io/badge/install-AI%20one--click-a14427)
 
-> Turn your QwenWork office credits into an OpenAI-compatible API, with a built-in admin dashboard. Multi-account, auto token refresh, quota board, API keys and request logs — no runtime dependencies.
+> Turn QwenWork (千问办公) office credits into an OpenAI-compatible API gateway.
+> Works with Claude Code, Codex, Cherry Studio, Cline, or as an upstream channel of new-api / one-api.
+> Multi-account pool, quota dashboard, timeout-retry with failover — **zero npm dependencies**.
+
+![管理后台 / Dashboard](docs/dashboard.png)
+
+## 为什么用它 / Why
+
+- **把闲置积分变成 API**：千问办公送的办公积分只能在官方客户端里用，这个项目让它能被任何 OpenAI 客户端调用。
+- **不用装客户端**：签名组件直接从官方 Linux 安装包解包提取，服务器（Linux / NAS / 软路由）就能跑。
+- **自带后台**：授权、余额、令牌、24 小时调用趋势、重试记录都在一个看板里。
+- **稳**：首字节超时、流式空闲超时、换号重试，避免上游偶发卡死拖挂客户端。
+
+---
+
+## AI 一键安装 / AI one-click install
+
+把下面这段提示词发给你的 AI 助手（Claude Code / Codex / Cursor / Hermes 等），它会自动完成部署：
+
+```text
+请帮我部署 qwenwork-gateway（https://github.com/jianhx189/qwenwork-gateway）：
+1. 克隆仓库并进入目录，确认 Node.js >= 20。
+2. 按 README「方式 A」下载千问办公 Linux 安装包，dpkg-deb 解包，
+   把 resources/qoder-auth-wasm/qoder_auth_wasm_bg.wasm 复制到项目根目录，然后删掉安装包和解包目录。
+3. 用 node server.mjs 启动（或 pm2 start ecosystem.config.cjs），确认 4021 端口在监听。
+4. 把后台地址（/admin）和 data/admin_token.txt 里的管理令牌给我，
+   提醒我去后台点「添加账号」完成千问办公授权。
+```
 
 ---
 
@@ -16,6 +47,7 @@
 | 多账号池 | 授权多个千问办公账号，按剩余积分自动选号 |
 | 自动续期 | `refresh_token` 到期自动换，无需反复扫码 |
 | 余额看板 | 剩余 / 已用积分、套餐、刷新时间，10 分钟自动更新 |
+| 用量图表 | 今日调用、成功率、平均耗时、24 小时趋势、按模型/账号分布 |
 | API 令牌 | 后台一键生成 `sk-qw-*`，可停用、可删除、带调用计数 |
 | 调用日志 | 时间、模型、账号、耗时、流式、错误，最近 100 条 |
 | 模型别名 | 对外只暴露 `qwen3.8max`，内部映射到千问办公「高级」档，可改 |
