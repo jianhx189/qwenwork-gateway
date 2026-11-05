@@ -135,10 +135,72 @@ function checkKey(authHeader) {
 }
 
 // ---------- 业务：OpenAI 端点 ----------
-function pickAccount() {
-  const usable = state.accounts.filter(a => a.status !== 'quota_exhausted' && a.access)
-  if (!usable.length) return null
-  return usable.sort((a, b) => (b.quota?.remaining ?? 0) - (a.quota?.remaining ?? 0))[0]
+// ---------- 重试策略（类比 WB：换号重试 + 首字节超时 + 流式空闲超时） ----------
+const MAX_RETRIES = Number(process.env.QW_MAX_RETRIES || 2)               // 首次之外的额外尝试次数
+const HEADER_TIMEOUT = Number(process.env.QW_HEADER_TIMEOUT_MS || 45000)  // 首字节超时
+const STREAM_IDLE = Number(process.env.QW_STREAM_IDLE_MS || 60000)        // 流式空闲超时
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+
+function pickAccount(exclude = new Set()) {
+  const all = state.accounts.filter(a => a.status !== 'quota_exhausted' && a.access)
+  if (!all.length) return null
+  // 优先选没试过的号；都试过（或只有一个号）时允许同号重试，不能直接放弃
+  const fresh = all.filter(a => !exclude.has(a.id))
+  const pool = fresh.length ? fresh : all
+  return pool.sort((a, b) => (b.quota?.remaining ?? 0) - (a.quota?.remaining ?? 0))[0]
+}
+
+// 首字节超时：真正中断底层 fetch，而不是只在表面 reject
+async function upstreamWithTimeout(body, acc, rt) {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(new Error('header timeout')), HEADER_TIMEOUT)
+  try {
+    return await chatResponse(body, acc, rt, { signer: prepareQwenworkInfer, signal: ctrl.signal })
+  } catch (e) {
+    if (ctrl.signal.aborted) throw new ProviderError(`千问办公 ${Math.round(HEADER_TIMEOUT / 1000)}s 未返回首字节`, 504, 'upstream_timeout')
+    throw e
+  } finally { clearTimeout(timer) }
+}
+
+// 流式读一帧，带空闲超时（对应 WB 的 stream idle timeout）
+async function readWithTimeout(reader) {
+  let timer
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise((_, rej) => { timer = setTimeout(() => rej(new ProviderError(`千问办公流式 ${Math.round(STREAM_IDLE / 1000)}s 无数据`, 504, 'stream_idle_timeout')), STREAM_IDLE) })
+    ])
+  } finally { clearTimeout(timer) }
+}
+
+// 单次尝试：拿到响应就转发；开始写字节后置标，供上层判断能否重试
+async function serveOnce(res, key, body, rt, acc, publicModel, upstreamModel, started) {
+  if (!acc.quota || Date.now() - (acc.lastRefresh ?? 0) > 10 * 60 * 1000) {
+    await refreshAccount(acc).catch(() => {})
+  }
+  const upstream = await upstreamWithTimeout(body, acc, rt)
+  const headers = Object.fromEntries(upstream.headers.entries())
+  headers['X-Gateway-Account'] = acc.email || acc.uid
+  headers['X-Gateway-Attempts'] = String(res._qwAttempts || 1)
+  delete headers['content-length']
+  const rename = (buf) => Buffer.from(
+    buf.toString('utf8')
+      .replaceAll(`"model":"${upstreamModel}"`, `"model":"${publicModel}"`)
+      .replaceAll(`"model": "${upstreamModel}"`, `"model": "${publicModel}"`)
+  )
+  res.writeHead(upstream.status, headers)
+  res._qwStarted = true
+  if (upstream.body) {
+    const reader = upstream.body.getReader()
+    try {
+      while (true) {
+        const { value, done } = await readWithTimeout(reader)
+        if (done) break
+        res.write(rename(Buffer.from(value)))
+      }
+    } finally { res.end() }
+  } else res.end()
+  log({ type: 'chat', key: key.name, account: acc.email || acc.uid, model: publicModel, stream: !!body.stream, ms: Date.now() - started, status: upstream.status, attempts: res._qwAttempts || 1 })
 }
 
 async function handleChat(req, res, key) {
@@ -151,46 +213,43 @@ async function handleChat(req, res, key) {
   body = { ...body, model: upstreamModel }
   const rt = runtimeInfo()
   if (!rt.ok) return json(res, 503, { error: { message: rt.error, type: 'provider_unavailable' } })
-  const acc = body?.model && body?.accountId
-    ? state.accounts.find(a => a.id === body.accountId)
-    : pickAccount()
-  if (!acc) return json(res, 503, { error: { message: '没有可用的千问办公账号，请先在后台授权', type: 'provider_unavailable' } })
+
   const started = Date.now()
-  try {
-    if (!acc.quota || Date.now() - (acc.lastRefresh ?? 0) > 10 * 60 * 1000) {
-      await refreshAccount(acc).catch(() => {})
+  const tried = new Set()
+  let lastErr = null
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const acc = body?.accountId
+      ? state.accounts.find(a => a.id === body.accountId)
+      : pickAccount(tried)
+    if (!acc) break
+    tried.add(acc.id)
+    res._qwAttempts = attempt + 1
+    res._qwStarted = false
+    try {
+      await serveOnce(res, key, body, rt, acc, publicModel, upstreamModel, started)
+      return
+    } catch (error) {
+      const e = error instanceof ProviderError ? error : new ProviderError(redact(error.message || '千问办公连接失败'), 503)
+      lastErr = e
+      // 已经向客户端吐过内容，再重试会重复输出，直接收尾
+      if (res._qwStarted || res.headersSent) { res.end(); return }
+      const retryable = e.status >= 500 || e.status === 429 || e.status === 401
+      if (!retryable || attempt >= MAX_RETRIES) break
+      log({ type: 'retry', key: key.name, account: acc.email || acc.uid, model: publicModel, attempt: attempt + 1, error: e.message })
+      // 401：先续期再试；429/限流：标记该账号，下一轮换号
+      if (e.status === 401) { await refreshAccount(acc, { force: true }).catch(() => {}) }
+      if (e.status === 429) { acc.status = 'quota_exhausted' }
+      await sleep(Math.min(2000, 500 * (attempt + 1)))
     }
-    const upstream = await chatResponse(body, acc, rt, { signer: prepareQwenworkInfer })
-    const headers = Object.fromEntries(upstream.headers.entries())
-    headers['X-Gateway-Account'] = acc.email || acc.uid
-    // 响应体的模型名必须是客户端请求的那个（qwen3.8max），不是上游内部档位名；
-    // 改写后长度会变，Content-Length 一律丢弃，让 Node 走 chunked。
-    delete headers['content-length']
-    const rename = (buf) => Buffer.from(
-      buf.toString('utf8')
-        .replaceAll(`"model":"${upstreamModel}"`, `"model":"${publicModel}"`)
-        .replaceAll(`"model": "${upstreamModel}"`, `"model": "${publicModel}"`)
-    )
-    res.writeHead(upstream.status, headers)
-    if (upstream.body) {
-      const reader = upstream.body.getReader()
-      try {
-        while (true) {
-          const { value, done } = await reader.read()
-          if (done) break
-          res.write(rename(Buffer.from(value)))
-        }
-      } finally { res.end() }
-    } else res.end()
-    log({ type: 'chat', key: key.name, account: acc.email || acc.uid, model: publicModel, stream: !!body.stream, ms: Date.now() - started, status: upstream.status })
-  } catch (error) {
-    const e = error instanceof ProviderError ? error : new ProviderError(redact(error.message || '千问办公连接失败'), 503)
-    log({ type: 'chat_error', key: key.name, account: acc.email || acc.uid, model: body?.model, ms: Date.now() - started, error: e.message })
-    if (!res.headersSent) {
-      const r = errorResponse(e)
-      json(res, e.status, await r.json())
-    } else res.end()
   }
+
+  const e = lastErr ?? new ProviderError('没有可用的千问办公账号，请先在后台授权', 503)
+  log({ type: 'chat_error', key: key.name, model: publicModel, ms: Date.now() - started, error: e.message })
+  if (!res.headersSent) {
+    const r = errorResponse(e)
+    json(res, e.status, await r.json())
+  } else res.end()
 }
 
 // ---------- 路由 ----------

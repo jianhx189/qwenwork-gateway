@@ -247,7 +247,7 @@ async function loadLogs(){
     const { logs } = await api('logs?n=100')
     $('#logs').innerHTML = logs.length ? logs.map(l=>{
       const t = new Date(l.ts).toLocaleTimeString('zh-CN',{hour12:false})
-      const type = l.type==='chat' ? '调用' : l.type==='chat_error' ? '失败' : l.type==='login' ? '授权' : l.type==='refresh_error' ? '刷新失败' : l.type
+      const type = l.type==='chat' ? '调用' : l.type==='chat_error' ? '失败' : l.type==='retry' ? '重试' : l.type==='login' ? '授权' : l.type==='refresh_error' ? '刷新失败' : l.type
       const st = l.error ? `<span class="pill err">${esc(l.error).slice(0,40)}</span>` : (l.status?`<span class="pill ok">${l.status}</span>`:'—')
       return `<tr><td class="mono">${t}</td><td>${esc(type)}</td><td class="mono">${esc(l.key||'—')}</td><td class="wrap">${esc(l.account||'—')}</td><td class="mono">${esc(l.model||'—')}</td><td>${l.stream?'是':'否'}</td><td>${l.ms?l.ms+'ms':'—'}</td><td>${st}</td></tr>`
     }).join('') : '<tr><td colspan="8" class="muted">暂无记录</td></tr>'
