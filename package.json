@@ -1,0 +1,14 @@
+{
+  "name": "qwenwork-gateway",
+  "version": "1.0.0",
+  "description": "把千问办公账号的办公积分转成 OpenAI 兼容 API，带管理后台。QwenWork office credits → OpenAI-compatible API with admin dashboard.",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
